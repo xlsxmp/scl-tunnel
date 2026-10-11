@@ -67,7 +67,6 @@ RULES_DIR="${WORK_DIR}/rules"
 SVC='argox-singbox'
 GH_PROXY="${GH_PROXY:-}"          # 可选: GitHub 反代前缀，如 https://xxx/
 BASE_PORT_DEFAULT='8080'          # VLESS(WS) 在本机 127.0.0.1 上的监听端口，也是 Cloudflare 回源端口
-WS_PATH_DEFAULT='argox'
 CDN_DOMAIN=("skk.moe" "ip.sb" "time.is" "cf.090227.xyz" "bestcf.top" "cdn.2020111.xyz")
 # 流媒体 / AI 预设（走链式出站）；geosite 对应 sing-geosite 的 rule-set
 UNLOCK_RULES=("geosite:netflix" "geosite:disney" "geosite:hulu" "geosite:hbo" "geosite:spotify" "geosite:openai" "domain:chatgpt.com" "domain:openai.com")
@@ -192,15 +191,17 @@ input_uuid() {
 }
 
 input_ws_path() {
-  local n=0
-  ask WS_PATH "请输入 WS 路径前缀（默认 ${WS_PATH_DEFAULT}）:"
-  WS_PATH=${WS_PATH:-$WS_PATH_DEFAULT}
+  local n=0 def
+  def=$(head -c 256 /dev/urandom | tr -dc 'a-z0-9' | head -c 8)
+  ask WS_PATH "请输入 WS 路径（回车随机生成）:"
+  WS_PATH=${WS_PATH:-$def}
   until [[ $WS_PATH =~ ^[A-Za-z0-9_.@-]+$ ]]; do
     ((n++)); [ "$n" -gt 4 ] && error "\n 输入错误次数过多，退出 \n"
     warning " 只允许字母、数字、- _ . @"
-    reading " 请重新输入: " WS_PATH
-    WS_PATH=${WS_PATH:-$WS_PATH_DEFAULT}
+    reading " 请重新输入（回车随机生成）: " WS_PATH
+    WS_PATH=${WS_PATH:-$def}
   done
+  info " WS 路径: /${WS_PATH}"
 }
 
 input_node_name() {
@@ -516,7 +517,13 @@ endpoint_wgconf() {
       peers: [ ({ address: $h, port: ($p | tonumber), public_key: $pub, allowed_ips: $al }
                 + (if $psk == "" then {} else { pre_shared_key: $psk } end)
                 + (if $ka == "" then {} else { persistent_keepalive_interval: ($ka | tonumber) } end)) ] }
-    + (if $mtu == "" then {} else { mtu: ($mtu | tonumber) } end)'
+    + (if $mtu == "" then {} else { mtu: ($mtu | tonumber) } end)
+    + (if $a6 == "" then { domain_resolver: { server: "local", strategy: "ipv4_only" } } else {} end)'
+}
+
+# 无 IPv6 地址的自定义 WireGuard：全局 DNS 只解析 IPv4，否则目标域名可能解析成 IPv6 而卡死
+dns_strategy() {
+  if [ "$WARP_SOURCE" = wgconf ] && [ -z "$CWG_V6" ]; then echo ipv4_only; fi
 }
 
 # 输出自定义 OpenVPN（openvpn-client）的 endpoint JSON
@@ -582,10 +589,10 @@ gen_config() {
   fi
   [ -n "$ep" ] || ep='null'
 
-  jq -n -c --arg token "$ARGO_TOKEN" --arg uuid "$UUID" --arg path "/${WS_PATH}-vl" --argjson port "$BASE_PORT" \
-    --argjson ep "$ep" --argjson rs "$rs" --argjson wr "$wr" --arg final "$final" --arg lvl "${SB_LOG_LEVEL:-warn}" '
+  jq -n -c --arg token "$ARGO_TOKEN" --arg uuid "$UUID" --arg path "/${WS_PATH}" --argjson port "$BASE_PORT" \
+    --argjson ep "$ep" --argjson rs "$rs" --argjson wr "$wr" --arg final "$final" --arg ds "$(dns_strategy)" --arg lvl "${SB_LOG_LEVEL:-warn}" '
     { log: { level: $lvl, timestamp: true },
-      dns: { servers: [ { type: "local", tag: "local" } ] },
+      dns: ({ servers: [ { type: "local", tag: "local" } ] } + (if $ds == "" then {} else { strategy: $ds } end)),
       inbounds: [
         { type: "cloudflared", tag: "cf-in", token: $token, grace_period: "3s" },
         { type: "vless", tag: "vless-in", listen: "127.0.0.1", listen_port: $port,
@@ -1120,9 +1127,9 @@ test_outbound() {
 
   port=$((20000 + RANDOM % 30000))
   while is_port_in_use "$port"; do port=$((20000 + RANDOM % 30000)); done
-  jq -n -c --argjson ep "$ep" --argjson port "$port" '
+  jq -n -c --argjson ep "$ep" --argjson port "$port" --arg ds "$(dns_strategy)" '
     { log: { level: "info" },
-      dns: { servers: [ { type: "local", tag: "local" } ] },
+      dns: ({ servers: [ { type: "local", tag: "local" } ] } + (if $ds == "" then {} else { strategy: $ds } end)),
       inbounds: [ { type: "mixed", tag: "t-in", listen: "127.0.0.1", listen_port: $port } ],
       outbounds: ([ { type: "direct", tag: "direct" } ] + (if $ep.type == "socks" then [ $ep ] else [] end)),
       endpoints: (if $ep.type == "socks" then [] else [ $ep ] end),
@@ -1305,7 +1312,7 @@ export_list() {
   load_conf
   svc status "$SVC" || { warning "\n sing-box 服务未运行，请先开启（argox -s） \n"; return 1; }
   local d=$ARGO_DOMAIN host=$CDN port=${CDN_PORT:-443} name=${NODE_NAME// /%20} vless
-  vless="vless://${UUID}@${host}:${port}?encryption=none&security=tls&sni=${d}&fp=chrome&type=ws&host=${d}&path=%2F${WS_PATH}-vl#${name}-vless"
+  vless="vless://${UUID}@${host}:${port}?encryption=none&security=tls&sni=${d}&fp=chrome&type=ws&host=${d}&path=%2F${WS_PATH}#${name}-vless"
   {
     echo "Argo 域名 : ${d}"
     echo "优选地址  : ${host}:${port}"
