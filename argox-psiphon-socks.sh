@@ -69,7 +69,11 @@ GH_PROXY="${GH_PROXY:-}"          # 可选: GitHub 反代前缀，如 https://xx
 BASE_PORT_DEFAULT='8080'          # VLESS(WS) 在本机 127.0.0.1 上的监听端口，也是 Cloudflare 回源端口
 CDN_DOMAIN=("skk.moe" "ip.sb" "time.is" "cf.090227.xyz" "bestcf.top" "cdn.2020111.xyz")
 # 流媒体 / AI 预设（走链式出站）；geosite 对应 sing-geosite 的 rule-set
-UNLOCK_RULES=("geosite:netflix" "geosite:disney" "geosite:hulu" "geosite:hbo" "geosite:spotify" "geosite:openai" "domain:chatgpt.com" "domain:openai.com")
+UNLOCK_RULES=("geosite:netflix" "geosite:disney" "geosite:hulu" "geosite:hbo" "geosite:spotify" "geosite:openai" "domain:chatgpt.com" "domain:openai.com"
+              "domain:claude.ai" "domain:claude.com" "domain:anthropic.com"
+              "domain:x.ai" "domain:grok.com" "domain:perplexity.ai"
+              "domain:gemini.google.com" "domain:aistudio.google.com" "domain:ai.google.dev"
+              "domain:ip.sb")
 CONF_KEYS=(UUID WS_PATH NODE_NAME BASE_PORT CDN CDN_PORT ARGO_DOMAIN ARGO_TOKEN WARP_MODE WARP_SOURCE WARP_STACK WARP_CUSTOM)
 CWG_KEYS=(CWG_PRIV CWG_V4 CWG_V6 CWG_PEER CWG_PSK CWG_HOST CWG_PORT CWG_ALLOWED CWG_KEEPALIVE CWG_MTU)
 SOURCE_DIRTY=0   # 来源刚导入/注册/切换，应用前需要连通性测试
@@ -1247,7 +1251,7 @@ warp_menu() {
   while true; do
     snapshot_src; SOURCE_DIRTY=0
     echo; warp_summary
-    hint "\n 1. 解锁流媒体 / AI（Netflix、Disney+、Hulu、HBO、Spotify、ChatGPT 走链式出站，其余直连）\n 2. 全局走链式出站（隐藏源站 IP，目标站看到的是出口 IP）\n 3. 仅使用自定义规则\n 4. 关闭链式出站\n 5. 编辑自定义规则（域名 / geosite）\n 6. 切换 WARP 解析栈（双栈 / 仅 IPv4 / 仅 IPv6，仅 WARP 来源）\n 7. 切换出站来源（WARP / 自定义 WireGuard / 自定义 OpenVPN / 赛风）\n 8. 重新注册 / 重新导入当前来源的账号或配置文件\n 9. 测试当前来源的连通性\n 0. 退出"
+    hint "\n 1. 解锁流媒体 / AI（Netflix、Disney+、Hulu、HBO、Spotify、ChatGPT、Claude、Grok、Gemini、Perplexity、ip.sb 走链式出站，其余直连）\n 2. 全局走链式出站（隐藏源站 IP，目标站看到的是出口 IP）\n 3. 仅使用自定义规则\n 4. 关闭链式出站\n 5. 编辑自定义规则（域名 / geosite）\n 6. 切换 WARP 解析栈（双栈 / 仅 IPv4 / 仅 IPv6，仅 WARP 来源）\n 7. 切换出站来源（WARP / 自定义 WireGuard / 自定义 OpenVPN / 赛风）\n 8. 重新注册 / 重新导入当前来源的账号或配置文件\n 9. 测试当前来源的连通性\n 0. 退出"
     reading "\n 请选择: " c
     case "$c" in
       1) WARP_MODE=unlock; apply_warp && info " 已启用: 流媒体 / AI 解锁（$(source_label)）" || revert_src ;;
