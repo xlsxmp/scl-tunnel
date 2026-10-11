@@ -13,7 +13,7 @@
 #               sing-box 通过 socks 出站接到 127.0.0.1:端口，可按国家选出口
 #   3. ovpn   : 自定义 OpenVPN（用户名密码）
 #               基于 sing-box 1.14+ 内置 openvpn-client endpoint，解析标准 .ovpn 获取
-#               服务器地址/协议/CA 证书/tls-auth|tls-crypt 等，账号密码单独输入
+#               服务器地址/协议/CA 证书/tls-auth|tls-crypt/auth 摘要/verify-x509-name/data-ciphers 等，账号密码单独输入
 #   分流模式（对三种来源都适用）: 解锁流媒体 & AI / 全局出站(隐藏源站 IP) / 自定义规则
 #
 # 保留: 固定隧道（Token，或用 Cloudflare API 令牌自动创建隧道/回源/DNS）、VLESS + WS + TLS
@@ -47,7 +47,7 @@
 #   WARP_MODE=unlock WARP_SOURCE=ovpn OVPN_CONF_FILE=/root/ai.ovpn \
 #   OVPN_USERNAME=user OVPN_PASSWORD=pass ... bash argox-lite.sh
 
-VERSION='lite-2.4 (sing-box)'
+VERSION='lite-2.5 (sing-box)'
 
 SINGBOX_VERSION="${SINGBOX_VERSION:-1.14.2}"
 WORK_DIR='/etc/argox'
@@ -69,7 +69,7 @@ GH_PROXY="${GH_PROXY:-}"          # 可选: GitHub 反代前缀，如 https://xx
 BASE_PORT_DEFAULT='8080'          # VLESS(WS) 在本机 127.0.0.1 上的监听端口，也是 Cloudflare 回源端口
 CDN_DOMAIN=("skk.moe" "ip.sb" "time.is" "cf.090227.xyz" "bestcf.top" "cdn.2020111.xyz")
 # 流媒体 / AI 预设（走链式出站）；geosite 对应 sing-geosite 的 rule-set
-UNLOCK_RULES=("geosite:netflix" "geosite:disney" "geosite:category-ai-!cn" "geosite:hbo" "geosite:spotify" "geosite:openai" "domain:chatgpt.com" "domain:openai.com"
+UNLOCK_RULES=("geosite:netflix" "geosite:disney" "geosite:hulu" "geosite:hbo" "geosite:spotify" "geosite:openai" "domain:chatgpt.com" "domain:openai.com"
               "domain:claude.ai" "domain:claude.com" "domain:anthropic.com"
               "domain:x.ai" "domain:grok.com" "domain:perplexity.ai"
               "domain:gemini.google.com" "domain:aistudio.google.com" "domain:ai.google.dev"
@@ -78,7 +78,7 @@ CONF_KEYS=(UUID WS_PATH NODE_NAME BASE_PORT CDN CDN_PORT ARGO_DOMAIN ARGO_TOKEN 
 CWG_KEYS=(CWG_PRIV CWG_V4 CWG_V6 CWG_PEER CWG_PSK CWG_HOST CWG_PORT CWG_ALLOWED CWG_KEEPALIVE CWG_MTU)
 SOURCE_DIRTY=0   # 来源刚导入/注册/切换，应用前需要连通性测试
 PSI_KEYS=(PSI_PORT PSI_COUNTRY PSI_STACK PSI_ENDPOINT)
-OVPN_KEYS=(OVPN_SERVER OVPN_PORT OVPN_PROTO OVPN_USER OVPN_PASS OVPN_CA OVPN_WRAP_TYPE OVPN_WRAP_KEY OVPN_WRAP_DIR)
+OVPN_KEYS=(OVPN_SERVER OVPN_PORT OVPN_PROTO OVPN_USER OVPN_PASS OVPN_CA OVPN_WRAP_TYPE OVPN_WRAP_KEY OVPN_WRAP_DIR OVPN_AUTH OVPN_SNAME OVPN_SNAME_TYPE OVPN_CIPHERS)
 
 # ---------------------------------------------------------------- 基础工具
 warning() { echo -e "\033[31m\033[01m$*\033[0m"; }
@@ -531,16 +531,21 @@ dns_strategy() {
 }
 
 # 输出自定义 OpenVPN（openvpn-client）的 endpoint JSON
+# 注意: auth 摘要同时决定 tls-auth 控制通道 HMAC，默认 SHA1；.ovpn 里写 auth SHA512（如 Windscribe）时必须传入，否则握手包被服务器丢弃
 endpoint_ovpn() {
   jq -n -c --arg s "$OVPN_SERVER" --argjson port "${OVPN_PORT:-1194}" --arg net "${OVPN_PROTO:-udp}" \
     --arg u "$OVPN_USER" --arg p "$OVPN_PASS" --arg ca "$OVPN_CA" \
-    --arg wt "$OVPN_WRAP_TYPE" --arg wk "$OVPN_WRAP_KEY" --arg wd "$OVPN_WRAP_DIR" '
+    --arg wt "$OVPN_WRAP_TYPE" --arg wk "$OVPN_WRAP_KEY" --arg wd "$OVPN_WRAP_DIR" \
+    --arg au "$OVPN_AUTH" --arg sn "$OVPN_SNAME" --arg snt "$OVPN_SNAME_TYPE" --arg dc "$OVPN_CIPHERS" '
     { type: "openvpn-client", tag: "warp", server: $s, server_port: $port, network: $net,
       username: $u, password: $p, auth_retry: "nointeract",
       tls: ({ certificate_path: $ca }
+            + (if $sn == "" then {} else { server_name: $sn, server_name_type: $snt } end)
             + (if $wt == "" or $wk == "" then {}
                else { control_wrap: ({ type: $wt, key_path: $wk }
-                                     + (if $wd == "" then {} else { direction: $wd } end)) } end)) }'
+                                     + (if $wd == "" then {} else { direction: $wd } end)) } end)) }
+    + (if $au == "" then {} else { auth: ($au | ascii_upcase) } end)
+    + (if $dc == "" then {} else { data_ciphers: ($dc | split(":")) } end)'
 }
 
 build_endpoint() {
@@ -800,7 +805,9 @@ import_wg_conf() {
 }
 
 # ---------------------------------------------------------------- 来源 3: 自定义 OpenVPN（用户名密码）
-# 解析标准 .ovpn 客户端配置: remote/proto、CA、tls-crypt / tls-auth(含 key-direction)；
+# 解析标准 .ovpn 客户端配置: remote/proto、CA、tls-crypt / tls-auth(含 key-direction)、
+#               auth 摘要（tls-auth HMAC 依赖它，如 Windscribe 的 auth SHA512）、
+#               verify-x509-name、data-ciphers / ncp-ciphers；
 # 账号密码优先级: .ovpn 内嵌 <auth-user-pass> > auth-user-pass 指向的文件 > 环境变量
 #               OVPN_USERNAME / OVPN_PASSWORD > 交互输入（密码不回显）
 # 配置文件路径: 环境变量 OVPN_CONF_FILE，或交互输入。需要 sing-box >= 1.14。
@@ -822,6 +829,7 @@ ovpn_path() { # 相对路径按 .ovpn 所在目录解析
 import_ovpn_conf() {
   local f=$OVPN_CONF_FILE clean="$TEMP_DIR/ovpn.clean" src ref u='' p='' kd='' rp=''
   local t_srv='' t_port='' t_proto='' t_ca='' t_wt='' t_wk='' t_wd=''
+  local t_auth='' t_sn='' t_snt='' t_dc=''
 
   if [ -z "$f" ] || [ ! -f "$f" ]; then
     reading "\n 请输入 OpenVPN 客户端配置文件（.ovpn）路径: " f
@@ -835,6 +843,15 @@ import_ovpn_conf() {
   t_port=${t_port:-1194}
   t_proto=$(ovpn_arg "$clean" proto 1); t_proto=${t_proto:-$rp}
   case "${t_proto,,}" in tcp*) t_proto=tcp ;; *) t_proto=udp ;; esac
+
+  # auth 摘要（默认 SHA1；tls-auth 控制通道 HMAC 也用它）
+  t_auth=$(ovpn_arg "$clean" auth 1)
+  # verify-x509-name <名称> [name|name-prefix|subject]
+  read -r t_sn t_snt <<< "$(awk '$1 == "verify-x509-name" { print $2, $3; exit }' "$clean")"
+  t_sn=${t_sn%\"}; t_sn=${t_sn#\"}
+  case "$t_snt" in name-prefix|subject) ;; *) t_snt=name ;; esac
+  # data-ciphers / ncp-ciphers（冒号分隔）
+  t_dc=$(awk '$1 == "data-ciphers" || $1 == "ncp-ciphers" { print $2; exit }' "$clean")
 
   # CA 证书: 内联 <ca> 优先，其次 ca 文件
   if ovpn_has_block "$clean" ca; then
@@ -904,8 +921,9 @@ import_ovpn_conf() {
 
   OVPN_SERVER=$t_srv; OVPN_PORT=$t_port; OVPN_PROTO=$t_proto; OVPN_USER=$u; OVPN_PASS=$p
   OVPN_CA=$t_ca; OVPN_WRAP_TYPE=$t_wt; OVPN_WRAP_KEY=$t_wk; OVPN_WRAP_DIR=$t_wd
+  OVPN_AUTH=$t_auth; OVPN_SNAME=$t_sn; OVPN_SNAME_TYPE=$t_snt; OVPN_CIPHERS=$t_dc
   save_ovpn
-  info " OpenVPN 配置解析成功: ${OVPN_SERVER}:${OVPN_PORT}/${OVPN_PROTO}${OVPN_WRAP_TYPE:+ (${OVPN_WRAP_TYPE})}"
+  info " OpenVPN 配置解析成功: ${OVPN_SERVER}:${OVPN_PORT}/${OVPN_PROTO}${OVPN_WRAP_TYPE:+ (${OVPN_WRAP_TYPE})}${OVPN_AUTH:+ auth=${OVPN_AUTH}}${OVPN_SNAME:+ verify=${OVPN_SNAME}}"
 }
 
 # ---------------------------------------------------------------- 选择来源 / 应用
@@ -1122,6 +1140,7 @@ confirm_force() { local c; reading " 测试未通过。仍然强制应用？[y/N
 # 起一个临时 sing-box 实例: 127.0.0.1 随机端口的 HTTP/SOCKS 入站 -> 新出站，
 # 经它访问 Cloudflare trace，成功即说明隧道握手/认证/解析都通。不改动正在运行的服务与 config.json。
 # OpenVPN 来源测试期间会临时停掉正在运行的服务（避免同账号并发连接被服务商拒绝），测完恢复。
+# 排查握手问题: TEST_LOG_LEVEL=debug argox -w
 test_outbound() {
   local tmo t0 ep port cfg="$TEMP_DIR/test.json" log="$TEMP_DIR/test.log" pid i out='' ip loc warp dip was_up=0 ok=1 chk
   local url='https://www.cloudflare.com/cdn-cgi/trace'
@@ -1131,8 +1150,8 @@ test_outbound() {
 
   port=$((20000 + RANDOM % 30000))
   while is_port_in_use "$port"; do port=$((20000 + RANDOM % 30000)); done
-  jq -n -c --argjson ep "$ep" --argjson port "$port" --arg ds "$(dns_strategy)" '
-    { log: { level: "info" },
+  jq -n -c --argjson ep "$ep" --argjson port "$port" --arg ds "$(dns_strategy)" --arg lvl "${TEST_LOG_LEVEL:-info}" '
+    { log: { level: $lvl },
       dns: ({ servers: [ { type: "local", tag: "local" } ] } + (if $ds == "" then {} else { strategy: $ds } end)),
       inbounds: [ { type: "mixed", tag: "t-in", listen: "127.0.0.1", listen_port: $port } ],
       outbounds: ([ { type: "direct", tag: "direct" } ] + (if $ep.type == "socks" then [ $ep ] else [] end)),
@@ -1186,7 +1205,7 @@ test_outbound() {
   cp -f "$log" "${WORK_DIR}/test.log" 2>/dev/null && chmod 600 "${WORK_DIR}/test.log"
   warning " 测试失败（等待 ${tmo} 秒内未能通过该出站访问外网）。sing-box 日志末尾（完整日志: ${WORK_DIR}/test.log）:\n$(grep -vE '^\s*$' "$log" 2>/dev/null | tail -n 15)"
   case "$WARP_SOURCE" in
-    ovpn)   hint " 常见原因: 用户名/密码错误、服务器拒绝连接、协议/端口被封、CA 或 tls-auth 密钥不匹配" ;;
+    ovpn)   hint " 常见原因: 用户名/密码错误、服务器拒绝连接、协议/端口被封、CA 或 tls-auth 密钥不匹配、auth 摘要不一致（如 SHA512）。可用 TEST_LOG_LEVEL=debug 重试查看握手细节" ;;
     wgconf) hint " 常见原因: 私钥/预共享密钥不对、Endpoint 不通或 UDP 被拦、域名解析失败（可在 [Peer] 加 PersistentKeepalive = 25）" ;;
     psiphon)
       hint " 赛风服务日志（最近 15 行）:"
