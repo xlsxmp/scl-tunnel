@@ -79,7 +79,7 @@ BASE_PORT_DEFAULT='8080'          # VLESS(WS) 在本机 127.0.0.1 上的监听�
 WS_PATH_DEFAULT='argox'
 CDN_DOMAIN=("skk.moe" "ip.sb" "time.is" "cf.090227.xyz" "bestcf.top" "cdn.2020111.xyz")
 # 流媒体 / AI 预设（走链式出站）；geosite 对应 sing-geosite 的 rule-set
-UNLOCK_RULES=("geosite:netflix" "geosite:disney" "geosite:hulu" "geosite:hbo" "geosite:spotify" "geosite:openai" "domain:chatgpt.com" "domain:openai.com")
+UNLOCK_RULES=("geosite:netflix" "geosite:disney" "geosite:category-ai-!cn" "geosite:hbo" "geosite:spotify" "geosite:openai" "domain:chatgpt.com" "domain:openai.com")
 CONF_KEYS=(UUID WS_PATH NODE_NAME BASE_PORT CDN CDN_PORT ARGO_DOMAIN ARGO_TOKEN WARP_MODE WARP_SOURCE WARP_STACK WARP_CUSTOM)
 CWG_KEYS=(CWG_PRIV CWG_V4 CWG_V6 CWG_PEER CWG_PSK CWG_HOST CWG_PORT CWG_ALLOWED CWG_KEEPALIVE CWG_MTU)
 SOURCE_DIRTY=0   # 来源刚导入/注册/切换，应用前需要连通性测试
