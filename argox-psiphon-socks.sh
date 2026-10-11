@@ -69,7 +69,7 @@ GH_PROXY="${GH_PROXY:-}"          # 可选: GitHub 反代前缀，如 https://xx
 BASE_PORT_DEFAULT='8080'          # VLESS(WS) 在本机 127.0.0.1 上的监听端口，也是 Cloudflare 回源端口
 CDN_DOMAIN=("skk.moe" "ip.sb" "time.is" "cf.090227.xyz" "bestcf.top" "cdn.2020111.xyz")
 # 流媒体 / AI 预设（走链式出站）；geosite 对应 sing-geosite 的 rule-set
-UNLOCK_RULES=("geosite:netflix" "geosite:disney" "geosite:hulu" "geosite:hbo" "geosite:spotify" "geosite:openai" "domain:chatgpt.com" "domain:openai.com"
+UNLOCK_RULES=("geosite:netflix" "geosite:disney" "geosite:category-ai-!cn" "geosite:hbo" "geosite:spotify" "geosite:openai" "domain:chatgpt.com" "domain:openai.com"
               "domain:claude.ai" "domain:claude.com" "domain:anthropic.com"
               "domain:x.ai" "domain:grok.com" "domain:perplexity.ai"
               "domain:gemini.google.com" "domain:aistudio.google.com" "domain:ai.google.dev"
