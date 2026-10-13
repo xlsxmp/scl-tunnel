@@ -6,15 +6,17 @@
 #   Cloudflare 边缘 ──隧道──> sing-box 内置 cloudflared 入站 ──路由──> 本地 VLESS(WS) 入站 ──> 出站(直连 / 链式出站)
 #   只有一个 sing-box 进程，不需要 cloudflared 二进制，也不需要 Xray。
 #
-# 链式出站（出站标签统一为 warp，四种来源互斥，不做二跳）:
+# 链式出站（出站标签统一为 warp，五种来源互斥，不做二跳）:
 #   1. warp   : Cloudflare WARP（自动注册，WireGuard）
 #   2. wgconf : 自定义 WireGuard 配置文件（如 ProtonVPN 官方后台导出的 .conf，解析标准 [Interface]/[Peer] 格式）
 #   4. psiphon: 赛风 Psiphon —— 本机起一个 SOCKS5 代理进程（Psiphon 官方 tunnel core，静态编译版），
 #               sing-box 通过 socks 出站接到 127.0.0.1:端口，可按国家选出口
 #   3. ovpn   : 自定义 OpenVPN（用户名密码）
 #               基于 sing-box 1.14+ 内置 openvpn-client endpoint，解析标准 .ovpn 获取
-#               服务器地址/协议/CA 证书/tls-auth|tls-crypt 等，账号密码单独输入
-#   分流模式（对三种来源都适用）: 解锁流媒体 & AI / 全局出站(隐藏源站 IP) / 自定义规则
+#               服务器地址/协议/CA 证书/tls-auth|tls-crypt/auth 摘要等，账号密码单独输入
+#   5. ss     : 自有 VPS 落地（Shadowsocks，纯 TCP 链路）—— 在你的 VPS 上先运行 ss-exit.sh 一键部署服务端，
+#               再在这里粘贴它输出的 ss:// 链接。适合本机出站 UDP 被封、WireGuard 走不通的 NAT 小鸡
+#   分流模式（对五种来源都适用）: 解锁流媒体 & AI / 全局出站(隐藏源站 IP) / 自定义规则
 #
 # 保留: 固定隧道（Token，或用 Cloudflare API 令牌自动创建隧道/回源/DNS）、VLESS + WS + TLS
 # 已移除: 临时隧道、Argo Json、cloudflared 二进制、Xray、VMess/Trojan
@@ -27,7 +29,7 @@
 #   bash argox-lite.sh            交互菜单（首次运行即安装）
 #   argox -n                      查看节点信息
 #   argox -t                      更换 Argo 隧道
-#   argox -w                      链式出站设置（WARP / WireGuard / OpenVPN / 赛风）
+#   argox -w                      链式出站设置（WARP / WireGuard / OpenVPN / 赛风 / 自有 VPS）
 #   argox -s                      开关 sing-box
 #   argox -v                      同步 sing-box 到最新版
 #   argox -u                      卸载
@@ -46,8 +48,10 @@
 #   # 自定义 OpenVPN（账号密码可省略，脚本会询问）
 #   WARP_MODE=unlock WARP_SOURCE=ovpn OVPN_CONF_FILE=/root/ai.ovpn \
 #   OVPN_USERNAME=user OVPN_PASSWORD=pass ... bash argox-lite.sh
+#   # 自有 VPS 落地（Shadowsocks）：SS_URI 为 ss-exit.sh 输出的链接；SS_NETWORK 默认 tcp（可选 udp / both）
+#   WARP_MODE=unlock WARP_SOURCE=ss SS_URI='ss://...' ... bash argox-lite.sh
 
-VERSION='lite-2.4 (sing-box)'
+VERSION='lite-2.6 (sing-box)'
 
 SINGBOX_VERSION="${SINGBOX_VERSION:-1.14.2}"
 WORK_DIR='/etc/argox'
@@ -83,6 +87,8 @@ CONF_KEYS=(UUID WS_PATH NODE_NAME BASE_PORT CDN CDN_PORT ARGO_DOMAIN ARGO_TOKEN 
 CWG_KEYS=(CWG_PRIV CWG_V4 CWG_V6 CWG_PEER CWG_PSK CWG_HOST CWG_PORT CWG_ALLOWED CWG_KEEPALIVE CWG_MTU)
 SOURCE_DIRTY=0   # 来源刚导入/注册/切换，应用前需要连通性测试
 PSI_KEYS=(PSI_PORT PSI_COUNTRY PSI_STACK PSI_ENDPOINT)
+SS_FILE="${WORK_DIR}/ss.conf"            # 自有 VPS（Shadowsocks）参数（SS_*）
+SS_KEYS=(SS_SERVER SS_PORT SS_METHOD SS_PASS SS_NETWORK)
 OVPN_KEYS=(OVPN_SERVER OVPN_PORT OVPN_PROTO OVPN_USER OVPN_PASS OVPN_CA OVPN_WRAP_TYPE OVPN_WRAP_KEY OVPN_WRAP_DIR OVPN_AUTH OVPN_SNAME OVPN_SNAME_TYPE OVPN_CIPHERS)
 
 # ---------------------------------------------------------------- 基础工具
@@ -250,6 +256,7 @@ load_conf() {
   [ -s "$CWG_FILE" ]  && . "$CWG_FILE"
   [ -s "$OVPN_FILE" ] && . "$OVPN_FILE"
   [ -s "$PSI_FILE" ]  && . "$PSI_FILE"
+  [ -s "$SS_FILE" ]   && . "$SS_FILE"
   WARP_MODE=${WARP_MODE:-off}
   WARP_SOURCE=${WARP_SOURCE:-warp}
   WARP_STACK=${WARP_STACK:-d}
@@ -277,6 +284,12 @@ save_psi() {
   : > "$PSI_FILE"; chmod 600 "$PSI_FILE"
   local k
   for k in "${PSI_KEYS[@]}"; do printf '%s=%q\n' "$k" "${!k}" >> "$PSI_FILE"; done
+}
+
+save_ss() {
+  : > "$SS_FILE"; chmod 600 "$SS_FILE"
+  local k
+  for k in "${SS_KEYS[@]}"; do printf '%s=%q\n' "$k" "${!k}" >> "$SS_FILE"; done
 }
 
 is_installed() { [ -s "$CONF_FILE" ] && [ -x "$WORK_DIR/sing-box" ]; }
@@ -466,6 +479,7 @@ source_label() {
     wgconf) echo '自定义 WireGuard' ;;
     ovpn)   echo '自定义 OpenVPN' ;;
     psiphon) echo '赛风 Psiphon' ;;
+    ss)     echo '自有 VPS（Shadowsocks）' ;;
     *)      echo 'Cloudflare WARP' ;;
   esac
 }
@@ -476,6 +490,7 @@ source_ready() {
     wgconf) [ -n "$CWG_PRIV" ] && [ -n "$CWG_PEER" ] && [ -n "$CWG_HOST" ] ;;
     ovpn)   [ -n "$OVPN_SERVER" ] && [ -n "$OVPN_USER" ] && [ -n "$OVPN_PASS" ] ;;
     psiphon) [ -n "$PSI_PORT" ] && [ -n "$PSI_COUNTRY" ] && [ -x "$PSI_BIN" ] ;;
+    ss)     [ -n "$SS_SERVER" ] && [ -n "$SS_PORT" ] && [ -n "$SS_METHOD" ] && [ -n "$SS_PASS" ] ;;
     *)      [ -n "$WG_PRIV" ] && [ -n "$WG_V4" ] ;;
   esac
 }
@@ -487,6 +502,7 @@ setup_source() {
     wgconf) import_wg_conf ;;
     ovpn)   import_ovpn_conf ;;
     psiphon) setup_psiphon ;;
+    ss)     import_ss ;;
     *)      warp_register || warp_manual ;;
   esac
   rc=$?
@@ -553,6 +569,7 @@ build_endpoint() {
     wgconf) endpoint_wgconf ;;
     ovpn)   endpoint_ovpn ;;
     psiphon) endpoint_psiphon ;;
+    ss)     endpoint_ss ;;
     *)      endpoint_warp ;;
   esac
 }
@@ -607,12 +624,12 @@ gen_config() {
         { type: "vless", tag: "vless-in", listen: "127.0.0.1", listen_port: $port,
           users: [ { uuid: $uuid } ], transport: { type: "ws", path: $path } }
       ],
-      outbounds: ([ { type: "direct", tag: "direct" } ] + (if $ep != null and $ep.type == "socks" then [ $ep ] else [] end)),
+      outbounds: ([ { type: "direct", tag: "direct" } ] + (if $ep != null and ($ep.type == "socks" or $ep.type == "shadowsocks") then [ $ep ] else [] end)),
       route: ({ default_domain_resolver: "local",
                 rules: ([ { inbound: ["cf-in"], outbound: "direct" } ] + $wr),
                 final: $final }
               + (if ($rs | length) > 0 then { rule_set: $rs } else {} end)) }
-    + (if $ep == null or $ep.type == "socks" then {} else { endpoints: [ $ep ] } end)' | jq . > "$SB_CONFIG" \
+    + (if $ep == null or $ep.type == "socks" or $ep.type == "shadowsocks" then {} else { endpoints: [ $ep ] } end)' | jq . > "$SB_CONFIG" \
     || error "\n config.json 生成失败 \n"
   chmod 600 "$SB_CONFIG"
 }
@@ -1123,22 +1140,97 @@ setup_psiphon() {
   info " 赛风 tunnel core 已启动: 127.0.0.1:${PSI_PORT}（${PSI_COUNTRY}）"
 }
 
+# ---------------------------------------------------------------- 来源 5: 自有 VPS 落地（Shadowsocks，纯 TCP 链路）
+# 落地机先运行 ss-exit.sh 一键部署服务端，它会输出 ss:// 链接；这里粘贴链接（或手动填参数）即可。
+# 入口机 → 落地机全程 TCP，适合出站 UDP 被封、WireGuard 走不通的 NAT 小鸡；目标域名交给落地机解析，
+# 出口 IP 就是你自己 VPS 的 IP。默认只走 TCP（SS_NETWORK=tcp）；本机 UDP 可用时可设 both / udp。
+# 环境变量: SS_URI=ss://...  或  SS_SERVER / SS_PORT / SS_METHOD / SS_PASSWORD（可选 SS_NETWORK）
+_ss_b64dec() { # base64 / base64url（容忍缺失的 = 填充）
+  local s; s=$(printf '%s' "$1" | tr '_-' '/+')
+  case $(( ${#s} % 4 )) in 2) s="${s}==" ;; 3) s="${s}=" ;; esac
+  printf '%s' "$s" | base64 -d 2>/dev/null
+}
+
+_ss_urldecode() { # 百分号解码（先转义反斜杠，避免被 printf %b 误解释）
+  local s=${1//\\/\\\\}
+  s=${s//\%/\\x}
+  printf '%b' "$s"
+}
+
+# 解析 ss://；成功时设置 _p_method _p_pass _p_host _p_port
+# 支持 SIP002（ss://base64url(method:pass)@host:port 或 ss://method:pass@host:port，userinfo 可百分号编码）
+# 与旧格式（ss://base64(method:pass@host:port)）；忽略 ?plugin= 与 #备注
+_ss_parse_uri() {
+  local u=${1#ss://} ui hp d
+  u=${u%%#*}; u=${u%%\?*}; u=${u%/}
+  _p_method=''; _p_pass=''; _p_host=''; _p_port=''
+  if [[ $u == *@* ]]; then
+    ui=${u%@*}; hp=${u##*@}
+    d=$(_ss_urldecode "$ui")
+    [[ $d == *:* ]] || d=$(_ss_b64dec "$d")
+  else
+    d=$(_ss_b64dec "$u")
+    [[ $d == *@* ]] || return 1
+    hp=${d##*@}; d=${d%@*}
+  fi
+  [[ $d == *:* ]] || return 1
+  _p_method=${d%%:*}; _p_pass=${d#*:}
+  _p_host=${hp%:*}; _p_port=${hp##*:}
+  _p_host=${_p_host#\[}; _p_host=${_p_host%\]}
+  [ -n "$_p_method" ] && [ -n "$_p_pass" ] && [ -n "$_p_host" ] && [[ $_p_port =~ ^[0-9]+$ ]]
+}
+
+# 输出自有 VPS（Shadowsocks）的 outbound JSON（普通出站，不是 endpoint）
+endpoint_ss() {
+  jq -n -c --arg s "$SS_SERVER" --argjson p "$SS_PORT" --arg m "$SS_METHOD" --arg pw "$SS_PASS" --arg n "${SS_NETWORK:-tcp}" '
+    { type: "shadowsocks", tag: "warp", server: $s, server_port: $p, method: $m, password: $pw }
+    + (if $n == "tcp" or $n == "udp" then { network: $n } else {} end)'
+}
+
+import_ss() {
+  local uri=$SS_URI srv=$SS_SERVER port=$SS_PORT method=$SS_METHOD pass=${SS_PASSWORD:-$SS_PASS} net=${SS_NETWORK:-tcp}
+  if [ -z "$uri" ] && { [ -z "$srv" ] || [ -z "$port" ] || [ -z "$method" ] || [ -z "$pass" ]; }; then
+    hint "\n 在你的落地 VPS 上运行 ss-exit.sh，会输出一条 ss:// 链接。粘贴到这里；直接回车则手动输入各项参数。"
+    reading " 请输入 ss:// 链接: " uri
+  fi
+  if [ -n "$uri" ]; then
+    uri=${uri//[[:space:]]/}
+    _ss_parse_uri "$uri" || { warning " ss:// 链接无法解析（应为 ss://方法:密码@地址:端口 的标准格式）"; return 1; }
+    method=$_p_method; pass=$_p_pass; srv=$_p_host; port=$_p_port
+  else
+    [ -n "$srv" ]    || reading " 落地机地址（IP 或域名）: " srv
+    [ -n "$port" ]   || reading " 端口: " port
+    [ -n "$method" ] || reading " 加密方式（如 chacha20-ietf-poly1305）: " method
+    [ -n "$pass" ]   || { read -rsp " 密码: " pass; echo; }
+  fi
+  if [ -z "$srv" ] || [ -z "$pass" ]; then warning " 落地机地址和密码不能为空"; return 1; fi
+  if ! { [[ $port =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; }; then warning " 端口无效: ${port}"; return 1; fi
+  if ! [[ $method =~ ^(2022-blake3-(aes-128-gcm|aes-256-gcm|chacha20-poly1305)|aes-(128|192|256)-gcm|chacha20-ietf-poly1305|xchacha20-ietf-poly1305|none)$ ]]; then
+    warning " 不支持的加密方式: ${method}"; return 1
+  fi
+  case "$net" in tcp|udp|both) ;; *) net=tcp ;; esac
+  SS_SERVER=$srv; SS_PORT=$port; SS_METHOD=$method; SS_PASS=$pass; SS_NETWORK=$net
+  save_ss
+  info " Shadowsocks 参数: ${SS_SERVER}:${SS_PORT}（${SS_METHOD}，${SS_NETWORK}）"
+}
+
 # 选择出站来源，写入 WARP_SOURCE；失败返回 1
 choose_source() {
   local c
-  hint "\n 链式出站来源（四选一，互斥，不做二跳）:\n 1. Cloudflare WARP（自动注册）\n 2. 自定义 WireGuard 配置文件（如 ProtonVPN 导出的 .conf）\n 3. 自定义 OpenVPN（.ovpn + 用户名密码，需 sing-box >= 1.14）\n 4. 赛风 Psiphon（本机 SOCKS5 代理，可按国家选出口；使用 Psiphon 官方 tunnel core）"
-  reading "\n 请选择 [1-4]，默认 1: " c
+  hint "\n 链式出站来源（五选一，互斥，不做二跳）:\n 1. Cloudflare WARP（自动注册）\n 2. 自定义 WireGuard 配置文件（如 ProtonVPN 导出的 .conf；需要本机能出站 UDP）\n 3. 自定义 OpenVPN（.ovpn + 用户名密码，需 sing-box >= 1.14）\n 4. 赛风 Psiphon（本机 SOCKS5 代理，可按国家选出口；使用 Psiphon 官方 tunnel core）\n 5. 自有 VPS 落地（Shadowsocks，纯 TCP；先在你的 VPS 上运行 ss-exit.sh，再粘贴它输出的 ss:// 链接）"
+  reading "\n 请选择 [1-5]，默认 1: " c
   case "$c" in
     2) WARP_SOURCE=wgconf ;;
     3) WARP_SOURCE=ovpn ;;
     4) WARP_SOURCE=psiphon ;;
+    5) WARP_SOURCE=ss ;;
     1|'') WARP_SOURCE=warp ;;
-    *) warning " 请输入 1、2、3 或 4"; return 1 ;;
+    *) warning " 请输入 1、2、3、4 或 5"; return 1 ;;
   esac
 }
 
 # ---- 来源文件快照：导入/注册失败时恢复，避免未验证的新参数覆盖旧参数
-snap_files() { echo "$WARP_FILE" "$CWG_FILE" "$OVPN_FILE" "$PSI_FILE" "${WORK_DIR}/ovpn_ca.pem" "${WORK_DIR}/ovpn_wrap.key"; }
+snap_files() { echo "$WARP_FILE" "$CWG_FILE" "$OVPN_FILE" "$PSI_FILE" "$SS_FILE" "${WORK_DIR}/ovpn_ca.pem" "${WORK_DIR}/ovpn_wrap.key"; }
 
 snapshot_src() {
   local f
@@ -1154,7 +1246,7 @@ restore_src() {
     if [ -f "$TEMP_DIR/snap/$(basename "$f")" ]; then cp -f "$TEMP_DIR/snap/$(basename "$f")" "$f"
     else rm -f "$f"; fi
   done
-  unset WG_PRIV WG_V4 WG_V6 WG_PEER WG_RESERVED WG_ENDPOINT "${CWG_KEYS[@]}" "${OVPN_KEYS[@]}" "${PSI_KEYS[@]}"
+  unset WG_PRIV WG_V4 WG_V6 WG_PEER WG_RESERVED WG_ENDPOINT "${CWG_KEYS[@]}" "${OVPN_KEYS[@]}" "${PSI_KEYS[@]}" "${SS_KEYS[@]}"
 }
 
 # 失败后回到操作前的状态（来源文件 + 配置变量）
@@ -1180,8 +1272,8 @@ _test_outbound_inner() {
     { log: { level: ($lvl // "info") },
       dns: { servers: [ { type: "local", tag: "local" } ] },
       inbounds: [ { type: "mixed", tag: "t-in", listen: "127.0.0.1", listen_port: $port } ],
-      outbounds: ([ { type: "direct", tag: "direct" } ] + (if $ep.type == "socks" then [ $ep ] else [] end)),
-      endpoints: (if $ep.type == "socks" then [] else [ $ep ] end),
+      outbounds: ([ { type: "direct", tag: "direct" } ] + (if ($ep.type == "socks" or $ep.type == "shadowsocks") then [ $ep ] else [] end)),
+      endpoints: (if ($ep.type == "socks" or $ep.type == "shadowsocks") then [] else [ $ep ] end),
       route: { default_domain_resolver: "local", final: "warp" } }' > "$cfg" || { warning " 测试配置生成失败"; return 1; }
   chmod 600 "$cfg"
 
@@ -1246,6 +1338,7 @@ _test_outbound_inner() {
     ovpn)   hint " 常见原因: 用户名/密码错误、服务器拒绝连接、协议/端口被封、CA 或 tls-auth 密钥不匹配、auth 摘要不一致（如 SHA512）。可用 TEST_LOG_LEVEL=debug 重试查看握手细节" ;;
     wgconf) hint " 常见原因: 私钥/预共享密钥不对、Endpoint 不通或 UDP 被拦、域名解析失败（可在 [Peer] 加 PersistentKeepalive = 25）" ;;
     psiphon) hint " 常见原因: 赛风基础设施不可达、该国家暂无可用节点（换个国家码重试）、二进制与系统不兼容。服务日志: $([ "$SYSTEM" = Alpine ] && echo "tail -n 30 ${WORK_DIR}/psiphon.log" || echo "journalctl -u ${PSI_SVC} -n 30 --no-pager")" ;;
+    ss)     hint " 常见原因: 落地机端口没放行（TCP；云厂商安全组也要放行）、密码或加密方式与落地机不一致、落地机 ss 服务没运行（落地机上执行 ss-exit.sh status 查看）。使用 2022-blake3 加密方式时，两端时间误差必须小于 30 秒" ;;
     *)      hint " 常见原因: WARP 的 UDP 2408 被拦、账号注册异常" ;;
   esac
   return 1
@@ -1295,6 +1388,7 @@ warp_summary() {
   local extra=''
   [ "$WARP_SOURCE" = warp ] || [ -z "$WARP_SOURCE" ] && extra=" | 解析栈: ${s}"
   [ "$WARP_SOURCE" = psiphon ] && extra=" | 国家: ${PSI_COUNTRY:-?} | 本机端口: ${PSI_PORT:-?}"
+  [ "$WARP_SOURCE" = ss ] && extra=" | 落地: ${SS_SERVER:-?}:${SS_PORT:-?} | 方式: ${SS_NETWORK:-tcp}"
   hint " 出站模式: ${m} | 来源: $(source_label) (${st})${extra} | 自定义规则: ${WARP_CUSTOM:-无}"
 }
 
@@ -1305,7 +1399,7 @@ warp_menu() {
   while true; do
     snapshot_src; SOURCE_DIRTY=0
     echo; warp_summary
-    hint "\n 1. 解锁流媒体 / AI（Netflix、Disney+、Hulu、HBO、Spotify、ChatGPT 走链式出站，其余直连）\n 2. 全局走链式出站（隐藏源站 IP，目标站看到的是出口 IP）\n 3. 仅使用自定义规则\n 4. 关闭链式出站\n 5. 编辑自定义规则（域名 / geosite）\n 6. 切换 WARP 解析栈（双栈 / 仅 IPv4 / 仅 IPv6，仅 WARP 来源）\n 7. 切换出站来源（WARP / 自定义 WireGuard / 自定义 OpenVPN / 赛风）\n 8. 重新注册 / 重新导入当前来源的账号或配置文件\n 9. 测试当前来源的连通性\n 0. 退出"
+    hint "\n 1. 解锁流媒体 / AI（Netflix、Disney+、Hulu、HBO、Spotify、ChatGPT 走链式出站，其余直连）\n 2. 全局走链式出站（隐藏源站 IP，目标站看到的是出口 IP）\n 3. 仅使用自定义规则\n 4. 关闭链式出站\n 5. 编辑自定义规则（域名 / geosite）\n 6. 切换 WARP 解析栈（双栈 / 仅 IPv4 / 仅 IPv6，仅 WARP 来源）\n 7. 切换出站来源（WARP / 自定义 WireGuard / 自定义 OpenVPN / 赛风 / 自有 VPS）\n 8. 重新注册 / 重新导入当前来源的账号或配置文件\n 9. 测试当前来源的连通性\n 0. 退出"
     reading "\n 请选择: " c
     case "$c" in
       1) WARP_MODE=unlock; apply_warp && info " 已启用: 流媒体 / AI 解锁（$(source_label)）" || revert_src ;;
@@ -1343,6 +1437,7 @@ warp_menu() {
           wgconf) WG_CONF_FILE='' ;;
           ovpn)   OVPN_CONF_FILE=''; OVPN_USERNAME=''; OVPN_PASSWORD='' ;;
           psiphon) PSIPHON_COUNTRY=''; PSIPHON_PORT=''; PSI_COUNTRY=''; PSI_PORT='' ;;
+          ss)     SS_URI=''; SS_SERVER=''; SS_PORT=''; SS_METHOD=''; SS_PASS=''; SS_PASSWORD='' ;;
           *)      unset WG_PRIV WG_V4 WG_V6 WG_PEER WG_RESERVED WG_ENDPOINT ;;
         esac
         if setup_source; then
@@ -1417,6 +1512,7 @@ install_all() {
       wgconf|conf|wireguard|2) WARP_SOURCE=wgconf ;;
       ovpn|openvpn|3) WARP_SOURCE=ovpn ;;
       psiphon|psi|4) WARP_SOURCE=psiphon ;;
+      ss|own|shadowsocks|5) WARP_SOURCE=ss ;;
       '') until choose_source; do :; done ;;
       *) warning " 无效的 WARP_SOURCE: ${WARP_SOURCE}，使用 warp"; WARP_SOURCE=warp ;;
     esac
@@ -1510,17 +1606,17 @@ status_line() {
 
 menu() {
   local c
-  echo; info " ArgoX Lite ${VERSION}  (sing-box + cloudflared inbound + WARP / WireGuard / OpenVPN / Psiphon)"
+  echo; info " ArgoX Lite ${VERSION}  (sing-box + cloudflared inbound + WARP / WireGuard / OpenVPN / Psiphon / 自有 VPS)"
   if is_installed; then
     load_conf; echo; status_line
-    hint "\n 1. 查看节点信息 (argox -n)\n 2. 更换 Argo 隧道 (argox -t)\n 3. 链式出站设置 WARP / WireGuard / OpenVPN / 赛风 (argox -w)\n 4. 开关 sing-box (argox -s)\n 5. 同步 sing-box 到最新版 (argox -v)\n 6. 卸载 (argox -u)\n 0. 退出"
+    hint "\n 1. 查看节点信息 (argox -n)\n 2. 更换 Argo 隧道 (argox -t)\n 3. 链式出站设置 WARP / WireGuard / OpenVPN / 赛风 / 自有 VPS (argox -w)\n 4. 开关 sing-box (argox -s)\n 5. 同步 sing-box 到最新版 (argox -v)\n 6. 卸载 (argox -u)\n 0. 退出"
     reading "\n 请选择: " c
     case "$c" in
       1) export_list ;; 2) change_tunnel ;; 3) warp_menu ;;
       4) toggle_svc ;; 5) upgrade_bins ;; 6) uninstall_all ;; *) exit 0 ;;
     esac
   else
-    hint "\n 1. 安装 ArgoX Lite (sing-box + cloudflared 入站 + VLESS，可选 WARP / 自定义 WireGuard / 自定义 OpenVPN / 赛风 链式出站)\n 0. 退出"
+    hint "\n 1. 安装 ArgoX Lite (sing-box + cloudflared 入站 + VLESS，可选 WARP / WireGuard / OpenVPN / 赛风 / 自有 VPS 链式出站)\n 0. 退出"
     reading "\n 请选择: " c
     [ "$c" = 1 ] && install_all || exit 0
   fi
