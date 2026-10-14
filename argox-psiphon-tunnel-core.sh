@@ -14,8 +14,8 @@
 #   3. ovpn   : 自定义 OpenVPN（用户名密码）
 #               基于 sing-box 1.14+ 内置 openvpn-client endpoint，解析标准 .ovpn 获取
 #               服务器地址/协议/CA 证书/tls-auth|tls-crypt/auth 摘要等，账号密码单独输入
-#   5. ss     : 自有 VPS 落地（Shadowsocks，纯 TCP 链路）—— 在你的 VPS 上先运行 ss-exit.sh 一键部署服务端，
-#               再在这里粘贴它输出的 ss:// 链接。适合本机出站 UDP 被封、WireGuard 走不通的 NAT 小鸡
+#   5. ss     : 自有 VPS 落地（纯 TCP 链路，按粘贴的节点链接自适应: ss:// vless:// trojan:// vmess://，
+#               VLESS/Trojan/VMess 支持 tcp / ws / httpupgrade + tls / reality）。适合本机出站 UDP 被封的 NAT 小鸡
 #   分流模式（对五种来源都适用）: 解锁流媒体 & AI / 全局出站(隐藏源站 IP) / 自定义规则
 #
 # 保留: 固定隧道（Token，或用 Cloudflare API 令牌自动创建隧道/回源/DNS）、VLESS + WS + TLS
@@ -48,10 +48,10 @@
 #   # 自定义 OpenVPN（账号密码可省略，脚本会询问）
 #   WARP_MODE=unlock WARP_SOURCE=ovpn OVPN_CONF_FILE=/root/ai.ovpn \
 #   OVPN_USERNAME=user OVPN_PASSWORD=pass ... bash argox-lite.sh
-#   # 自有 VPS 落地（Shadowsocks）：SS_URI 为 ss-exit.sh 输出的链接；SS_NETWORK 默认 tcp（可选 udp / both）
+#   # 自有 VPS 落地：SS_URI 为节点链接（ss:// vless:// trojan:// vmess://，自动识别协议）
 #   WARP_MODE=unlock WARP_SOURCE=ss SS_URI='ss://...' ... bash argox-lite.sh
 
-VERSION='lite-2.6 (sing-box)'
+VERSION='lite-2.7 (sing-box)'
 
 SINGBOX_VERSION="${SINGBOX_VERSION:-1.14.2}"
 WORK_DIR='/etc/argox'
@@ -87,8 +87,8 @@ CONF_KEYS=(UUID WS_PATH NODE_NAME BASE_PORT CDN CDN_PORT ARGO_DOMAIN ARGO_TOKEN 
 CWG_KEYS=(CWG_PRIV CWG_V4 CWG_V6 CWG_PEER CWG_PSK CWG_HOST CWG_PORT CWG_ALLOWED CWG_KEEPALIVE CWG_MTU)
 SOURCE_DIRTY=0   # 来源刚导入/注册/切换，应用前需要连通性测试
 PSI_KEYS=(PSI_PORT PSI_COUNTRY PSI_STACK PSI_ENDPOINT)
-SS_FILE="${WORK_DIR}/ss.conf"            # 自有 VPS（Shadowsocks）参数（SS_*）
-SS_KEYS=(SS_SERVER SS_PORT SS_METHOD SS_PASS SS_NETWORK)
+SS_FILE="${WORK_DIR}/ss.conf"            # 自有 VPS 节点参数（SS_*）
+SS_KEYS=(SS_PROTO SS_SERVER SS_PORT SS_METHOD SS_PASS SS_NETWORK SS_OUT)
 OVPN_KEYS=(OVPN_SERVER OVPN_PORT OVPN_PROTO OVPN_USER OVPN_PASS OVPN_CA OVPN_WRAP_TYPE OVPN_WRAP_KEY OVPN_WRAP_DIR OVPN_AUTH OVPN_SNAME OVPN_SNAME_TYPE OVPN_CIPHERS)
 
 # ---------------------------------------------------------------- 基础工具
@@ -479,7 +479,7 @@ source_label() {
     wgconf) echo '自定义 WireGuard' ;;
     ovpn)   echo '自定义 OpenVPN' ;;
     psiphon) echo '赛风 Psiphon' ;;
-    ss)     echo '自有 VPS（Shadowsocks）' ;;
+    ss)     echo '自有 VPS 落地' ;;
     *)      echo 'Cloudflare WARP' ;;
   esac
 }
@@ -490,7 +490,7 @@ source_ready() {
     wgconf) [ -n "$CWG_PRIV" ] && [ -n "$CWG_PEER" ] && [ -n "$CWG_HOST" ] ;;
     ovpn)   [ -n "$OVPN_SERVER" ] && [ -n "$OVPN_USER" ] && [ -n "$OVPN_PASS" ] ;;
     psiphon) [ -n "$PSI_PORT" ] && [ -n "$PSI_COUNTRY" ] && [ -x "$PSI_BIN" ] ;;
-    ss)     [ -n "$SS_SERVER" ] && [ -n "$SS_PORT" ] && [ -n "$SS_METHOD" ] && [ -n "$SS_PASS" ] ;;
+    ss)     [ -n "$SS_OUT" ] || { [ -n "$SS_SERVER" ] && [ -n "$SS_PORT" ] && [ -n "$SS_METHOD" ] && [ -n "$SS_PASS" ]; } ;;
     *)      [ -n "$WG_PRIV" ] && [ -n "$WG_V4" ] ;;
   esac
 }
@@ -624,12 +624,12 @@ gen_config() {
         { type: "vless", tag: "vless-in", listen: "127.0.0.1", listen_port: $port,
           users: [ { uuid: $uuid } ], transport: { type: "ws", path: $path } }
       ],
-      outbounds: ([ { type: "direct", tag: "direct" } ] + (if $ep != null and ($ep.type == "socks" or $ep.type == "shadowsocks") then [ $ep ] else [] end)),
+      outbounds: ([ { type: "direct", tag: "direct" } ] + (if $ep != null and ($ep.type | IN("socks","shadowsocks","vless","trojan","vmess")) then [ $ep ] else [] end)),
       route: ({ default_domain_resolver: "local",
                 rules: ([ { inbound: ["cf-in"], outbound: "direct" } ] + $wr),
                 final: $final }
               + (if ($rs | length) > 0 then { rule_set: $rs } else {} end)) }
-    + (if $ep == null or $ep.type == "socks" or $ep.type == "shadowsocks" then {} else { endpoints: [ $ep ] } end)' | jq . > "$SB_CONFIG" \
+    + (if $ep == null or ($ep.type | IN("socks","shadowsocks","vless","trojan","vmess")) then {} else { endpoints: [ $ep ] } end)' | jq . > "$SB_CONFIG" \
     || error "\n config.json 生成失败 \n"
   chmod 600 "$SB_CONFIG"
 }
@@ -1140,11 +1140,15 @@ setup_psiphon() {
   info " 赛风 tunnel core 已启动: 127.0.0.1:${PSI_PORT}（${PSI_COUNTRY}）"
 }
 
-# ---------------------------------------------------------------- 来源 5: 自有 VPS 落地（Shadowsocks，纯 TCP 链路）
-# 落地机先运行 ss-exit.sh 一键部署服务端，它会输出 ss:// 链接；这里粘贴链接（或手动填参数）即可。
-# 入口机 → 落地机全程 TCP，适合出站 UDP 被封、WireGuard 走不通的 NAT 小鸡；目标域名交给落地机解析，
-# 出口 IP 就是你自己 VPS 的 IP。默认只走 TCP（SS_NETWORK=tcp）；本机 UDP 可用时可设 both / udp。
-# 环境变量: SS_URI=ss://...  或  SS_SERVER / SS_PORT / SS_METHOD / SS_PASSWORD（可选 SS_NETWORK）
+# ---------------------------------------------------------------- 来源 5: 自有 VPS 落地（按节点链接自适应）
+# 粘贴你自己 VPS 上的节点链接，按协议自动适配（出站标签统一为 warp）:
+#   ss://      Shadowsocks（纯 TCP；落地机可用 ss-exit.sh 一键部署，或在 Xray / sing-box 里加 shadowsocks 入站）
+#   vless://   VLESS + tcp / ws / httpupgrade，security=none / tls / reality（可经 Cloudflare 隧道域名连接）
+#   trojan://  Trojan + tcp / ws / httpupgrade + tls
+#   vmess://   VMess（base64 JSON 链接）+ tcp / ws / httpupgrade
+# 不支持: xhttp（sing-box 没有该传输层）、VLESS Encryption、kcp / quic / h2 等。
+# 全部是 TCP 链路，适合本机出站 UDP 被封的 NAT 小鸡；目标域名交给落地机解析，出口 IP 就是你 VPS 的 IP。
+# 环境变量: SS_URI=<节点链接>  或（仅 ss）SS_SERVER / SS_PORT / SS_METHOD / SS_PASSWORD / SS_NETWORK
 _ss_b64dec() { # base64 / base64url（容忍缺失的 = 填充）
   local s; s=$(printf '%s' "$1" | tr '_-' '/+')
   case $(( ${#s} % 4 )) in 2) s="${s}==" ;; 3) s="${s}=" ;; esac
@@ -1180,23 +1184,167 @@ _ss_parse_uri() {
   [ -n "$_p_method" ] && [ -n "$_p_pass" ] && [ -n "$_p_host" ] && [[ $_p_port =~ ^[0-9]+$ ]]
 }
 
-# 输出自有 VPS（Shadowsocks）的 outbound JSON（普通出站，不是 endpoint）
-endpoint_ss() {
-  jq -n -c --arg s "$SS_SERVER" --argjson p "$SS_PORT" --arg m "$SS_METHOD" --arg pw "$SS_PASS" --arg n "${SS_NETWORK:-tcp}" '
+# Shadowsocks outbound JSON（server port method password network）
+_ss_build_out() {
+  jq -n -c --arg s "$1" --argjson p "$2" --arg m "$3" --arg pw "$4" --arg n "${5:-tcp}" '
     { type: "shadowsocks", tag: "warp", server: $s, server_port: $p, method: $m, password: $pw }
     + (if $n == "tcp" or $n == "udp" then { network: $n } else {} end)'
 }
 
+# 解析 vless:// trojan:// 这类 URL 风格链接；设置 _n_user _n_host _n_port 和关联数组 _q（查询参数）
+_node_parse_url() {
+  local u=${1#*://} qs='' hp p k v
+  local -a kv
+  u=${u%%#*}
+  if [[ $u == *\?* ]]; then qs=${u#*\?}; u=${u%%\?*}; fi
+  u=${u%/}
+  [[ $u == *@* ]] || return 1
+  _n_user=$(_ss_urldecode "${u%@*}")
+  hp=${u##*@}
+  if [[ $hp == \[*\]* ]]; then
+    _n_host=${hp#\[}; _n_host=${_n_host%%\]*}; _n_port=${hp##*\]:}
+  else
+    _n_host=${hp%:*}; _n_port=${hp##*:}
+  fi
+  declare -gA _q=()
+  IFS='&' read -ra kv <<< "$qs"
+  for p in "${kv[@]}"; do
+    [ -n "$p" ] || continue
+    k=${p%%=*}; v=''
+    [[ $p == *=* ]] && v=${p#*=}
+    _q[$k]=$(_ss_urldecode "$v")
+  done
+  [ -n "$_n_user" ] && [ -n "$_n_host" ] && [[ $_n_port =~ ^[0-9]+$ ]]
+}
+
+# 由 _q 生成 tls 对象；$1 为缺省 security（trojan 传 tls）。不启用 TLS 时输出 null
+# SNI 缺省顺序: sni > peer > host（与常见客户端一致，经 CDN / 隧道域名时 host 即域名）
+_node_tls_json() {
+  local sec=${_q[security]:-$1}
+  case "$sec" in tls|reality) ;; *) echo null; return 0 ;; esac
+  jq -n -c --arg sec "$sec" --arg sni "${_q[sni]:-${_q[peer]:-${_q[host]:-}}}" --arg fp "${_q[fp]:-}" --arg alpn "${_q[alpn]:-}" \
+    --arg ins "${_q[allowInsecure]:-${_q[insecure]:-}}" --arg pbk "${_q[pbk]:-}" --arg sid "${_q[sid]:-}" '
+    { enabled: true }
+    + (if $sni != "" then { server_name: $sni } else {} end)
+    + (if $ins == "1" or $ins == "true" then { insecure: true } else {} end)
+    + (if $alpn != "" then { alpn: ($alpn | split(",")) } else {} end)
+    + (if $sec == "reality"
+       then { reality: { enabled: true, public_key: $pbk, short_id: $sid },
+              utls: { enabled: true, fingerprint: (if $fp == "" then "chrome" else $fp end) } }
+       elif $fp != "" then { utls: { enabled: true, fingerprint: $fp } } else {} end)'
+}
+
+# 由 _q 生成 transport 对象；$1 为传输类型。tcp 输出 null；不支持的类型在 stderr 说明原因并返回 1
+_node_transport_json() {
+  local t=${1:-tcp} path=${_q[path]:-/} host=${_q[host]:-${_q[sni]:-}} ed=''
+  case "${t,,}" in
+    tcp|none|'')
+      [ "${_q[headerType]:-none}" = none ] || { warning " 不支持 tcp 的 HTTP 伪装头（headerType=${_q[headerType]}）" >&2; return 1; }
+      echo null ;;
+    ws)
+      if [[ $path =~ \?ed=([0-9]+) ]]; then ed=${BASH_REMATCH[1]}; path=${path%%\?*}; fi
+      jq -n -c --arg path "$path" --arg host "$host" --arg ed "$ed" '
+        { type: "ws", path: $path }
+        + (if $host != "" then { headers: { Host: $host } } else {} end)
+        + (if $ed != "" then { max_early_data: ($ed | tonumber), early_data_header_name: "Sec-WebSocket-Protocol" } else {} end)' ;;
+    httpupgrade)
+      jq -n -c --arg path "$path" --arg host "$host" '
+        { type: "httpupgrade", path: $path } + (if $host != "" then { host: $host } else {} end)' ;;
+    grpc)
+      jq -n -c --arg sn "${_q[serviceName]:-}" '{ type: "grpc", service_name: $sn }' ;;
+    *)
+      warning " 不支持的传输方式: ${t}（sing-box 没有 xhttp / kcp / quic / h2 这类传输层，请在落地机上另开 ws 或 tcp 入站）" >&2
+      return 1 ;;
+  esac
+}
+
+# 把节点链接转成 sing-box 出站 JSON（tag=warp）；失败时 stderr 说明原因并返回 1
+_node_to_outbound() {
+  local link=$1 scheme=${1%%://*} tls tr t j
+  scheme=${scheme,,}
+  case "$scheme" in
+    vless|trojan)
+      _node_parse_url "$link" || { warning " 链接无法解析（需要 ${scheme}://用户@地址:端口?参数）" >&2; return 1; }
+      if [ "$scheme" = vless ] && [ -n "${_q[encryption]:-}" ] && [ "${_q[encryption]}" != none ]; then
+        warning " 不支持 VLESS Encryption（encryption=${_q[encryption]:0:12}…），sing-box 只支持 encryption=none" >&2; return 1
+      fi
+      if [ "${_q[security]:-}" = reality ] && [ -z "${_q[pbk]:-}" ]; then
+        warning " reality 链接缺少公钥参数 pbk" >&2; return 1
+      fi
+      t=${_q[type]:-tcp}
+      tr=$(_node_transport_json "$t") || return 1
+      if [ "$scheme" = trojan ]; then tls=$(_node_tls_json tls); else tls=$(_node_tls_json ''); fi
+      if [ "$scheme" = vless ]; then
+        jq -n -c --arg s "$_n_host" --argjson p "$_n_port" --arg u "$_n_user" --arg flow "${_q[flow]:-}" --argjson tls "$tls" --argjson tr "$tr" '
+          { type: "vless", tag: "warp", server: $s, server_port: $p, uuid: $u }
+          + (if $flow != "" then { flow: $flow } else {} end)
+          + (if $tls != null then { tls: $tls } else {} end)
+          + (if $tr != null then { transport: $tr } else {} end)'
+      else
+        jq -n -c --arg s "$_n_host" --argjson p "$_n_port" --arg pw "$_n_user" --argjson tls "$tls" --argjson tr "$tr" '
+          { type: "trojan", tag: "warp", server: $s, server_port: $p, password: $pw }
+          + (if $tls != null then { tls: $tls } else {} end)
+          + (if $tr != null then { transport: $tr } else {} end)'
+      fi ;;
+    vmess)
+      j=$(_ss_b64dec "${link#*://}")
+      jq -e 'type == "object" and (.add // "") != "" and (.id // "") != ""' <<< "$j" >/dev/null 2>&1 \
+        || { warning " vmess 链接无法解析（应为 vmess://base64(JSON)）" >&2; return 1; }
+      declare -gA _q=()
+      _n_host=$(jq -r '.add' <<< "$j"); _n_port=$(jq -r '.port | tostring' <<< "$j"); _n_user=$(jq -r '.id' <<< "$j")
+      [[ $_n_port =~ ^[0-9]+$ ]] || { warning " vmess 端口无效" >&2; return 1; }
+      t=$(jq -r '.net // "tcp"' <<< "$j")
+      _q[host]=$(jq -r '.host // ""' <<< "$j"); _q[path]=$(jq -r '.path // ""' <<< "$j")
+      _q[sni]=$(jq -r '.sni // ""' <<< "$j"); _q[alpn]=$(jq -r '.alpn // ""' <<< "$j"); _q[fp]=$(jq -r '.fp // ""' <<< "$j")
+      _q[headerType]=$(jq -r '.type // "none"' <<< "$j"); _q[serviceName]=${_q[path]}
+      [ "$(jq -r '.tls // ""' <<< "$j")" = tls ] && _q[security]=tls
+      tr=$(_node_transport_json "$t") || return 1
+      tls=$(_node_tls_json '')
+      jq -n -c --arg s "$_n_host" --argjson p "$_n_port" --arg u "$_n_user" --argjson tls "$tls" --argjson tr "$tr" \
+        --arg sec "$(jq -r '.scy // "auto"' <<< "$j")" --argjson aid "$(jq -r '(.aid // 0) | tonumber' <<< "$j" 2>/dev/null || echo 0)" '
+        { type: "vmess", tag: "warp", server: $s, server_port: $p, uuid: $u, security: $sec, alter_id: $aid }
+        + (if $tls != null then { tls: $tls } else {} end)
+        + (if $tr != null then { transport: $tr } else {} end)' ;;
+    *)
+      warning " 不支持的链接类型: ${scheme}://（支持 ss:// vless:// trojan:// vmess://）" >&2; return 1 ;;
+  esac
+}
+
+# 输出自有 VPS 节点的 outbound JSON（普通出站，不是 endpoint）
+endpoint_ss() {
+  if [ -n "$SS_OUT" ]; then echo "$SS_OUT"
+  else _ss_build_out "$SS_SERVER" "$SS_PORT" "$SS_METHOD" "$SS_PASS" "${SS_NETWORK:-tcp}"; fi
+}
+
+# 保存导入结果: $1=出站 JSON；$2 $3 $4 仅 ss 使用（加密方式 / 密码 / 网络）
+_node_save() {
+  SS_OUT=$1
+  SS_PROTO=$(jq -r '.type' <<< "$SS_OUT")
+  SS_SERVER=$(jq -r '.server' <<< "$SS_OUT"); SS_PORT=$(jq -r '.server_port' <<< "$SS_OUT")
+  SS_METHOD=${2:-}; SS_PASS=${3:-}; SS_NETWORK=${4:-}
+  save_ss
+  info " 节点已导入: ${SS_PROTO} ${SS_SERVER}:${SS_PORT}（传输 $(jq -r '.transport.type // "tcp"' <<< "$SS_OUT")，TLS $(jq -r 'if .tls.reality.enabled then "reality" elif .tls.enabled then "开" else "关" end' <<< "$SS_OUT")）"
+}
+
 import_ss() {
-  local uri=$SS_URI srv=$SS_SERVER port=$SS_PORT method=$SS_METHOD pass=${SS_PASSWORD:-$SS_PASS} net=${SS_NETWORK:-tcp}
+  local uri=$SS_URI srv=$SS_SERVER port=$SS_PORT method=$SS_METHOD pass=${SS_PASSWORD:-$SS_PASS} net=${SS_NETWORK:-tcp} out
   if [ -z "$uri" ] && { [ -z "$srv" ] || [ -z "$port" ] || [ -z "$method" ] || [ -z "$pass" ]; }; then
-    hint "\n 在你的落地 VPS 上运行 ss-exit.sh，会输出一条 ss:// 链接。粘贴到这里；直接回车则手动输入各项参数。"
-    reading " 请输入 ss:// 链接: " uri
+    hint "\n 粘贴你自己 VPS 的节点链接，按协议自动适配: ss:// vless:// trojan:// vmess://"
+    hint " （ss:// 可由落地机上的 ss-exit.sh 输出；直接回车则手动输入 Shadowsocks 参数）"
+    reading " 请输入节点链接: " uri
   fi
   if [ -n "$uri" ]; then
     uri=${uri//[[:space:]]/}
-    _ss_parse_uri "$uri" || { warning " ss:// 链接无法解析（应为 ss://方法:密码@地址:端口 的标准格式）"; return 1; }
-    method=$_p_method; pass=$_p_pass; srv=$_p_host; port=$_p_port
+    case "${uri,,}" in
+      ss://*)
+        _ss_parse_uri "$uri" || { warning " ss:// 链接无法解析（应为 ss://方法:密码@地址:端口 的标准格式）"; return 1; }
+        method=$_p_method; pass=$_p_pass; srv=$_p_host; port=$_p_port ;;
+      vless://*|trojan://*|vmess://*)
+        out=$(_node_to_outbound "$uri") || return 1
+        _node_save "$out"
+        return 0 ;;
+      *) warning " 不支持的链接类型（支持 ss:// vless:// trojan:// vmess://）"; return 1 ;;
+    esac
   else
     [ -n "$srv" ]    || reading " 落地机地址（IP 或域名）: " srv
     [ -n "$port" ]   || reading " 端口: " port
@@ -1209,15 +1357,14 @@ import_ss() {
     warning " 不支持的加密方式: ${method}"; return 1
   fi
   case "$net" in tcp|udp|both) ;; *) net=tcp ;; esac
-  SS_SERVER=$srv; SS_PORT=$port; SS_METHOD=$method; SS_PASS=$pass; SS_NETWORK=$net
-  save_ss
-  info " Shadowsocks 参数: ${SS_SERVER}:${SS_PORT}（${SS_METHOD}，${SS_NETWORK}）"
+  out=$(_ss_build_out "$srv" "$port" "$method" "$pass" "$net")
+  _node_save "$out" "$method" "$pass" "$net"
 }
 
 # 选择出站来源，写入 WARP_SOURCE；失败返回 1
 choose_source() {
   local c
-  hint "\n 链式出站来源（五选一，互斥，不做二跳）:\n 1. Cloudflare WARP（自动注册）\n 2. 自定义 WireGuard 配置文件（如 ProtonVPN 导出的 .conf；需要本机能出站 UDP）\n 3. 自定义 OpenVPN（.ovpn + 用户名密码，需 sing-box >= 1.14）\n 4. 赛风 Psiphon（本机 SOCKS5 代理，可按国家选出口；使用 Psiphon 官方 tunnel core）\n 5. 自有 VPS 落地（Shadowsocks，纯 TCP；先在你的 VPS 上运行 ss-exit.sh，再粘贴它输出的 ss:// 链接）"
+  hint "\n 链式出站来源（五选一，互斥，不做二跳）:\n 1. Cloudflare WARP（自动注册）\n 2. 自定义 WireGuard 配置文件（如 ProtonVPN 导出的 .conf；需要本机能出站 UDP）\n 3. 自定义 OpenVPN（.ovpn + 用户名密码，需 sing-box >= 1.14）\n 4. 赛风 Psiphon（本机 SOCKS5 代理，可按国家选出口；使用 Psiphon 官方 tunnel core）\n 5. 自有 VPS 落地（粘贴节点链接，按协议自动适配: ss:// vless:// trojan:// vmess://，纯 TCP 链路）"
   reading "\n 请选择 [1-5]，默认 1: " c
   case "$c" in
     2) WARP_SOURCE=wgconf ;;
@@ -1272,8 +1419,8 @@ _test_outbound_inner() {
     { log: { level: ($lvl // "info") },
       dns: { servers: [ { type: "local", tag: "local" } ] },
       inbounds: [ { type: "mixed", tag: "t-in", listen: "127.0.0.1", listen_port: $port } ],
-      outbounds: ([ { type: "direct", tag: "direct" } ] + (if ($ep.type == "socks" or $ep.type == "shadowsocks") then [ $ep ] else [] end)),
-      endpoints: (if ($ep.type == "socks" or $ep.type == "shadowsocks") then [] else [ $ep ] end),
+      outbounds: ([ { type: "direct", tag: "direct" } ] + (if ($ep.type | IN("socks","shadowsocks","vless","trojan","vmess")) then [ $ep ] else [] end)),
+      endpoints: (if ($ep.type | IN("socks","shadowsocks","vless","trojan","vmess")) then [] else [ $ep ] end),
       route: { default_domain_resolver: "local", final: "warp" } }' > "$cfg" || { warning " 测试配置生成失败"; return 1; }
   chmod 600 "$cfg"
 
@@ -1388,7 +1535,7 @@ warp_summary() {
   local extra=''
   [ "$WARP_SOURCE" = warp ] || [ -z "$WARP_SOURCE" ] && extra=" | 解析栈: ${s}"
   [ "$WARP_SOURCE" = psiphon ] && extra=" | 国家: ${PSI_COUNTRY:-?} | 本机端口: ${PSI_PORT:-?}"
-  [ "$WARP_SOURCE" = ss ] && extra=" | 落地: ${SS_SERVER:-?}:${SS_PORT:-?} | 方式: ${SS_NETWORK:-tcp}"
+  [ "$WARP_SOURCE" = ss ] && extra=" | 落地: ${SS_SERVER:-?}:${SS_PORT:-?} | 协议: ${SS_PROTO:-shadowsocks}"
   hint " 出站模式: ${m} | 来源: $(source_label) (${st})${extra} | 自定义规则: ${WARP_CUSTOM:-无}"
 }
 
@@ -1437,7 +1584,7 @@ warp_menu() {
           wgconf) WG_CONF_FILE='' ;;
           ovpn)   OVPN_CONF_FILE=''; OVPN_USERNAME=''; OVPN_PASSWORD='' ;;
           psiphon) PSIPHON_COUNTRY=''; PSIPHON_PORT=''; PSI_COUNTRY=''; PSI_PORT='' ;;
-          ss)     SS_URI=''; SS_SERVER=''; SS_PORT=''; SS_METHOD=''; SS_PASS=''; SS_PASSWORD='' ;;
+          ss)     SS_URI=''; SS_OUT=''; SS_PROTO=''; SS_SERVER=''; SS_PORT=''; SS_METHOD=''; SS_PASS=''; SS_PASSWORD='' ;;
           *)      unset WG_PRIV WG_V4 WG_V6 WG_PEER WG_RESERVED WG_ENDPOINT ;;
         esac
         if setup_source; then
